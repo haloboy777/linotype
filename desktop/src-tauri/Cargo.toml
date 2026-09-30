@@ -1,0 +1,13 @@
+[package]
+name = "linotype"
+version = "0.1.0"
+description = "Edit the text of any PDF in place, in its own fonts"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"

@@ -490,7 +490,7 @@ footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--border);font:
     </ul>
   </section>
 
-  <footer>Linotype is free, open-source software (AGPL-3.0).</footer>
+  <footer>Linotype is free, open-source software (AGPL-3.0). <a href="https://github.com/haloboy777/linotype" target="_blank" rel="noopener" style="color:inherit">Source code on GitHub</a>.</footer>
 </main>
 <script>
 const drop = document.getElementById('drop'), msg = document.getElementById('msg'), pick = document.getElementById('pick');
@@ -956,8 +956,9 @@ SERVER_TEXT = [
      'Added fonts are used only for your document, kept in memory, and deleted with it.'),
     ('<div class="label">Stays on this computer</div>\n        <div class="desc">Linotype makes no network requests. Your PDFs and fonts are never uploaded anywhere.</div>',
      '<div class="label">Processed on this server, never stored</div>\n        <div class="desc">Your PDF is uploaded here only to show and save it. It stays in memory, is never written to disk, and is deleted when you close it or after {idle} minutes idle.</div>'),
-    ('<footer>Linotype is free, open-source software (AGPL-3.0).</footer>',
-     '<footer>Linotype is free, open-source software (AGPL-3.0). <a href="/source.tar.gz" style="color:inherit">Download the source code</a>.</footer>'),
+    # AGPL §13 covers the code actually running here, which can be ahead of GitHub for a moment
+    ('Source code on GitHub</a>.</footer>',
+     'Source code on GitHub</a> · <a href="/source.tar.gz" style="color:inherit">exact running version</a>.</footer>'),
 ]
 
 

@@ -1,8 +1,11 @@
-# Linotype
+<p align="center">
+  <img src="engine/assets/icon-source.png" width="112" alt="Linotype logo: a serif L on a black rounded square">
+</p>
+<h1 align="center">Linotype</h1>
+<p align="center">Edit the text of any PDF in place, in its own fonts.</p>
+<p align="center"><a href="https://pdf.ayushsingh.dev">pdf.ayushsingh.dev</a> · AGPL-3.0</p>
 
-Edit the text of any PDF in place, in its own fonts.
-
-Drop a PDF in, click any text, type, save. Linotype shows each page exactly as it looks, lets the text you click reflow as you type in the same typeface, and writes the change back into the original file. Everything you didn't touch stays byte-for-byte the same, and the new text is real, searchable text. Nothing leaves your computer.
+Drop a PDF in, click any text, type, save. Linotype shows each page exactly as it looks, lets the text you click reflow as you type in the same typeface, and writes the change back into the original file. Everything you didn't touch stays byte-for-byte the same, and the new text is real, searchable text. The desktop app never sends anything off your computer; the website keeps your file in memory only while you edit it.
 
 ## Use it
 

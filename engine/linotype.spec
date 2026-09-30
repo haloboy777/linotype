@@ -2,6 +2,7 @@
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 datas, binaries, hiddenimports = collect_all("pymupdf")
+datas += [("static", "static")]  # favicons
 hiddenimports += collect_submodules("fontTools") + collect_submodules("webview")
 
 a = Analysis(["desktop.py"], datas=datas, binaries=binaries, hiddenimports=hiddenimports,

@@ -227,6 +227,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path in STATIC:
+            ctype, data = STATIC[path]
+            return self.send(data, ctype, headers=[("Cache-Control", "public, max-age=604800")])
         if path == "/login":
             return self.send(login_page())
         if path == "/source.tar.gz":
@@ -346,6 +349,7 @@ class Handler(BaseHTTPRequestHandler):
 
 HOME = r"""<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Linotype</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png"><link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
 /* Base Web (baseweb.design) light/dark theme tokens */
 :root{
@@ -532,6 +536,7 @@ tabs.forEach((t, i) => {
 
 SHELL = r"""<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Linotype</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png"><link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
 :root{--bg:#F3F3F3;--fg:#000000;--muted:#5E5E5E;--bar:#FFFFFF;--line:#E8E8E8;--accent:#276EF1;--btn:#F3F3F3;--btn-h:#E8E8E8;
   --warn:#9F6402;--inverse:#000000;--on-inverse:#FFFFFF}
@@ -969,6 +974,7 @@ def login_page(error=""):
     note = f'<p class="err">{error}</p>' if error else ""
     return f"""<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Linotype · Sign in</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png"><link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
 :root{{--bg:#FFFFFF;--bg2:#F3F3F3;--fg:#000000;--fg2:#4B4B4B;--line:#DDDDDD;--inverse:#000000;--on-inverse:#FFFFFF;--neg:#DE1135}}
 @media (prefers-color-scheme:dark){{:root{{--bg:#161616;--bg2:#292929;--fg:#DEDEDE;--fg2:#C4C4C4;--line:#383838;--inverse:#DEDEDE;--on-inverse:#000000;--neg:#DE5B5D}}}}
@@ -994,6 +1000,13 @@ button{{width:100%;margin-top:16px;font:inherit;font-weight:500;border:0;border-
 
 
 SOURCE = source_tarball()
+
+_static = Path(__file__).resolve().parent / "static"
+STATIC = {f"/{name}": (ctype, (_static / name).read_bytes())
+          for name, ctype in (("favicon.svg", "image/svg+xml"), ("favicon-32.png", "image/png"),
+                              ("apple-touch-icon.png", "image/png")) if (_static / name).exists()}
+if "/favicon-32.png" in STATIC:  # browsers ask for /favicon.ico on their own; PNG data is accepted there
+    STATIC["/favicon.ico"] = STATIC["/favicon-32.png"]
 
 
 def main():

@@ -6,33 +6,51 @@ Drop a PDF in, click any text, type, save. Linotype shows each page exactly as i
 
 ## Use it
 
-**Desktop app** (macOS for now): open Linotype, drop a PDF on the window, or right-click a PDF → Open With → Linotype. Edit, then **Save PDF** (⌘S). The edited copy is written as `<name>-edited.pdf` and opens in your PDF viewer.
+**Desktop app** (macOS 11+ on Apple Silicon for now): open Linotype, drop a PDF on the window, or right-click a PDF → Open With → Linotype. Edit, then **Save PDF** (⌘S). The edited copy is written as `<name>-edited.pdf` and opens in your PDF viewer.
 
-**From source, in your browser:**
+**From source:**
 
 ```
 cd engine
-uv run app.py              # drop page
-uv run app.py file.pdf     # straight into the editor; saves next to the file
+uv run desktop.py          # native window (pywebview)
+uv run desktop.py file.pdf # straight into the editor; saves next to the file
+uv run app.py              # same thing in your browser instead of a window
 ```
 
 ## Layout
 
+Everything is Python, in `engine/`:
+
 ```
-engine/    Python: PDF → editable HTML, and edits → PDF (PyMuPDF, fontTools)
-desktop/   Tauri shell: native window; runs the engine as a sidecar
+render.py     PDF page → editable HTML in the PDF's own fonts (PyMuPDF, fontTools)
+editor.py     click-to-edit boxes that reflow in the same fonts
+writeback.py  edits → the original PDF
+app.py        local server (127.0.0.1): drop page, editor, save
+desktop.py    native window around app.py (pywebview: WKWebView on macOS, WebView2 on Windows)
+harness.py    scores renders against the real page
 ```
 
 Build the app:
 
 ```
-cd desktop
-pnpm install
-pnpm sidecar               # freezes the engine into src-tauri/binaries/ (PyInstaller)
-pnpm tauri build           # → src-tauri/target/release/bundle/macos/Linotype.app
+cd engine
+./build_app.sh             # → dist/Linotype.app and dist/Linotype.dmg (PyInstaller, linotype.spec)
 ```
 
-The shell starts `linotype-engine`, reads the `LINOTYPE_URL` / `LINOTYPE_TOKEN` lines it prints, and points the window at it. Files opened from Finder go through `/open-path`, which needs the token.
+The build first syntax-checks the pages' JavaScript, which lives in Python strings. Finder "Open With" and drops on the Dock icon arrive as `application:openURLs:` on the app delegate; `desktop.py` extends pywebview's delegate to handle them.
+
+## Server mode
+
+Linotype also runs as a website: `LINOTYPE_MODE=server` adds a password login, keeps each visitor's PDFs and added fonts in memory only (dropped after 30 minutes idle, never written to disk), and makes Save a download. Settings are environment variables, listed at the top of `engine/app.py`. The drop page links to `/source.tar.gz`, since the AGPL requires offering the source to people who use it over a network.
+
+Running at pdf.ayushsingh.dev on the Hetzner box:
+
+- code in `~/apps/linotype`, uv venv on Python 3.12, `fonts-noto-core` for Hindi
+- `/etc/linotype/linotype.env` (root, 600): mode, password, `127.0.0.1:8091`, limits
+- `linotype.service`: `Restart=always`, enabled at boot, `MemoryMax=1200M`, read-only filesystem
+- nginx site `pdf.ayushsingh.dev` → `127.0.0.1:8091`, Cloudflare origin cert, 60 MB uploads
+
+Update it with `engine/deploy_server.sh`. Change the password by editing the env file, then `sudo systemctl restart linotype` (this also signs everyone out).
 
 ## How it works
 
@@ -45,8 +63,11 @@ The shell starts `linotype-engine`, reads the `LINOTYPE_URL` / `LINOTYPE_TOKEN` 
 - character maps from glyph names plus the PDF's `/Encoding /Differences` and `/ToUnicode`
 - broken text layers repaired: ToUnicode disagreeing with glyph names, and fonts in Mac glyph order where every letter is shifted by 29 (`*HQWO\` → `Gently`)
 - anything missing falls back to a system font of the same style (serif, sans, mono)
+- shaped scripts (Hindi and other Indic scripts, Arabic, Thai): drawn whole words at a time, stretched to the PDF's word width, so the browser can join letters, attach vowel signs and form conjuncts. Subsets that kept only finished glyphs fall back to a system font for that script (Kohinoor Devanagari, Nirmala UI, Noto)
 
 Only fonts reachable through the page's actual `Do` calls count, because resource dicts are often shared by every page.
+
+**Adding the original fonts.** PDFs usually carry only trimmed copies of their fonts, sometimes too trimmed to edit with (Google Docs' Hindi subsets keep only finished letter shapes). **Aa Fonts** lists every font the text uses, how much of the text it covers and whether the PDF's copy is usable. Add a `.ttf`, `.otf`, `.ttc`, `.woff` or `.woff2` file per font, via the button or by dropping it on the row. It then comes first for viewing, editing and saving, and is subset on save. Fonts whose license says "restricted" (`fsType` 2) or "bitmaps only" are refused; "view & print only" and name mismatches get a warning. Added fonts live in memory for as long as the app runs and are never written to disk.
 
 **Editing** (`engine/editor.py`). Each text block gets an invisible `contenteditable` box over its glyphs. Clicking swaps the exact glyphs for the box, which reflows in the same fonts:
 
@@ -58,7 +79,9 @@ Only fonts reachable through the page's actual `Do` calls count, because resourc
 - a box that grows past its space is outlined red with `+N lines`
 - rotated or translucent text and legal notices are locked
 
-**Saving** (`engine/writeback.py`). For each edited block, the old text is removed with a text-only redaction (images and vector art stay), and every glyph is placed where the browser drew it, in the same embedded font.
+**Keep original** (on by default, next to Save) attaches `linotype-original.pdf` and `linotype-state.json` (what each edited box holds) to the saved file. Opening that file in Linotype edits the original again with the saved edits restored as live boxes, and offers **Revert to original**. Anyone with the file can extract the original, so it's a toggle. Files saved without it are still read back: Linotype tags its shaped-script words and reads its own tags on reopen.
+
+**Saving** (`engine/writeback.py`). For each edited block, the old text is removed with a text-only redaction (images and vector art stay), and every glyph is placed where the browser drew it, in the same embedded font. Shaped scripts go word by word through MuPDF's HTML engine (HarfBuzz) in the same font the browser used, all words of a block on one layer so the font is embedded once, wrapped in `/ActualText` so copy and search return the real text. Baselines come from the browser: a character's box top plus its font's ascent.
 
 ## Test harness
 
@@ -93,6 +116,7 @@ Output lands in `engine/out/`, which is git-ignored because it holds renders of 
 - Glyphs with no Unicode mapping (some chart symbols) draw nothing.
 - Text painted underneath an image ends up on top of it.
 - Rotated pages aren't handled on save yet.
+- Hindi and other shaped scripts use a system font when the PDF's subset can't shape, so an edited paragraph can wrap differently from the original.
 
 ## License
 

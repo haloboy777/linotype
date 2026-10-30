@@ -70,8 +70,45 @@ def font_overrides(s):
 ORIGINAL, STATE = "linotype-original.pdf", "linotype-state.json"
 
 
+class PasswordNeeded(ValueError):
+    """The PDF is locked: no password was given, or the one given didn't open it."""
+
+    def __init__(self, message, wrong=False):
+        super().__init__(message)
+        self.wrong = wrong
+
+
+def unlock(data, password):
+    """A locked PDF and its password -> (decrypted copy, original permission flags). Everything
+    downstream works on the decrypted copy: MuPDF reads an authenticated-but-still-encrypted
+    document unreliably (its page text came out as content-stream syntax errors in testing)."""
+    doc = pymupdf.open("pdf", data)
+    if not doc.needs_pass:
+        return data, None
+    if not password:
+        raise PasswordNeeded("This PDF is locked. Enter its password to open it.")
+    if not doc.authenticate(password):
+        raise PasswordNeeded("That password didn't open it.", wrong=True)
+    permissions = doc.permissions
+    plain = doc.tobytes(encryption=pymupdf.PDF_ENCRYPT_NONE)
+    if pymupdf.open("pdf", plain).needs_pass:
+        raise PasswordNeeded("That password didn't open it.", wrong=True)
+    return plain, permissions
+
+
+def relock(pdf, password, permissions):
+    """Encrypt a saved copy again with the password it came with (AES-256)."""
+    doc = pymupdf.open("pdf", pdf)
+    return doc.tobytes(garbage=3, deflate=True, encryption=pymupdf.PDF_ENCRYPT_AES_256,
+                       user_pw=password, owner_pw=password,
+                       permissions=permissions if permissions is not None else -1)
+
+
 class Session:
-    def __init__(self, name, data, src=None):
+    def __init__(self, name, data, src=None, password=None):
+        # a locked PDF is checked against its password once, then edited as a decrypted copy
+        data, self.permissions = unlock(data, password)
+        self.password = password if self.permissions is not None else None
         self.name, self.data, self.src = name, data, src
         self.doc = pymupdf.open("pdf", data)
         self.restore, self.has_original = [], False
@@ -85,9 +122,8 @@ class Session:
                 self.data, self.restore, self.has_original = original, state.get("pages", []), True
             except Exception:
                 self.doc = pymupdf.open("pdf", data)  # damaged attachment: edit the file as it is
-        if self.doc.needs_pass:
-            raise ValueError("This PDF is password-protected. Remove the password in your PDF viewer "
-                             "(or with the tool that made it), then open it again.")
+        if self.doc.needs_pass:  # e.g. a saved original that is itself locked
+            raise PasswordNeeded("This PDF is locked. Enter its password to open it.")
         self.lock = threading.Lock()  # a MuPDF document isn't safe to use from two threads
         self.pages = {}
         self.fonts = {}
@@ -102,23 +138,23 @@ class Session:
                                                overrides=font_overrides(self))
             return self.pages[n]
 
-    def out_path(self, download=False):
-        stem = re.sub(r"-edited(-\d+)?$", "", Path(self.name).stem)
+    def out_path(self, download=False, suffix="edited"):
+        stem = re.sub(r"-(edited|unlocked)(-\d+)?$", "", Path(self.name).stem)
         if download:
-            return f"{stem}-edited.pdf"
+            return f"{stem}-{suffix}.pdf"
         folder = Path(self.src).parent if self.src else Path.home() / "Downloads"
-        path, i = folder / f"{stem}-edited.pdf", 2
+        path, i = folder / f"{stem}-{suffix}.pdf", 2
         while path.exists():
-            path, i = folder / f"{stem}-edited-{i}.pdf", i + 1
+            path, i = folder / f"{stem}-{suffix}-{i}.pdf", i + 1
         return path
 
 
-def new_session(name, data, src=None):
+def new_session(name, data, src=None, password=None):
     if SERVER:
         while len(sessions) >= MAX_DOCS:  # full: drop the one idle longest
             sessions.pop(min(sessions, key=lambda k: sessions[k].last), None)
     sid = secrets.token_urlsafe(16)
-    sessions[sid] = Session(name, data, src)
+    sessions[sid] = Session(name, data, src, password)
     return sid
 
 
@@ -265,7 +301,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json({"fonts": rows})
         if m.group(2) == "/info":
             return self.json({"name": s.name, "pages": [[p.rect.width, p.rect.height] for p in s.doc],
-                              "restore": s.restore, "hasOriginal": s.has_original})
+                              "restore": s.restore, "hasOriginal": s.has_original,
+                              "locked": s.password is not None})
         n = int(m.group(3))
         if not 0 <= n < len(s.doc):
             return self.send("No such page", "text/plain", 404)
@@ -290,8 +327,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not data.startswith(b"%PDF"):
                     return self.json({"error": "That doesn't look like a PDF."}, 400)
                 name = unquote(self.headers.get("X-Filename", "document.pdf"))
+                # the password of a locked PDF comes in a header: never in the URL, never logged
+                password = unquote(self.headers.get("X-Pdf-Password", "")) or None
                 try:
-                    return self.json({"id": new_session(Path(name).name, data)})
+                    return self.json({"id": new_session(Path(name).name, data, password=password)})
+                except PasswordNeeded as e:
+                    if e.wrong:
+                        time.sleep(0.5)
+                    return self.json({"error": str(e), "needPassword": True, "wrong": e.wrong}, 422)
                 except ValueError as e:
                     return self.json({"error": str(e)}, 400)
             m = re.fullmatch(r"/d/([\w-]+)/(save|close|reveal|font|font-remove)", path)
@@ -329,20 +372,26 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(body, list):  # older pages sent just the edit list
                 body = {"edits": body, "state": [], "keep": False}
             edits = body["edits"]
+            remove_pw = s.password is not None and body.get("unlock", True)
             with s.lock:
                 out = writeback.apply(s.data, edits, s.fonts)
                 if body.get("keep"):
                     out = attach_original(out, s.data, body.get("state", []))
+                if s.password is not None and not remove_pw:
+                    out = relock(out, s.password, s.permissions)
+            suffix = "unlocked" if remove_pw and not edits else "edited"
             if SERVER:  # hand the file to the browser; nothing is written on the server
-                name = s.out_path(download=True)
+                name = s.out_path(download=True, suffix=suffix)
                 return self.send(out, "application/pdf", headers=[
                     ("Content-Disposition", f"attachment; filename*=UTF-8''{quote(name)}"),
-                    ("X-Linotype-Name", quote(name)), ("X-Linotype-Kept", "1" if body.get("keep") else "0")])
-            dest = s.out_path()
+                    ("X-Linotype-Name", quote(name)), ("X-Linotype-Kept", "1" if body.get("keep") else "0"),
+                    ("X-Linotype-Unlocked", "1" if remove_pw else "0")])
+            dest = s.out_path(suffix=suffix)
             dest.write_bytes(out)
             s.saved = dest
             open_file(str(dest))
-            return self.json({"path": str(dest), "name": dest.name, "kept": bool(body.get("keep"))})
+            return self.json({"path": str(dest), "name": dest.name, "kept": bool(body.get("keep")),
+                              "unlocked": remove_pw})
         except Exception as e:  # show the reason in the page rather than a dead request
             return self.json({"error": f"{type(e).__name__}: {e}"}, 500)
 
@@ -382,6 +431,11 @@ body.over #drop{border-color:var(--accent);background:var(--accent-light)}
 .btn.primary{background:var(--inverse);color:var(--on-inverse)}
 .btn.primary:hover{opacity:.86}
 #msg{font:500 14px/20px var(--font);min-height:20px;color:var(--fg2)}
+#pwform{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+#pwform[hidden]{display:none}
+#pwform input{font:400 16px/20px var(--font);padding:12px 14px;border-radius:8px;border:2px solid var(--bg3);background:var(--bg);color:var(--fg);min-width:220px;outline:none}
+#pwform input:focus{border-color:var(--fg)}
+#pwform .btn:not(.primary){background:var(--bg3);color:var(--fg)}
 #msg.err{color:var(--negative)}
 
 /* Tabs */
@@ -425,6 +479,11 @@ footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--border);font:
     <button class="btn primary" type="button" tabindex="-1">Choose a PDF…</button>
     <div class="hint">Or right-click a PDF in Finder → Open With → Linotype</div>
     <div id="msg" aria-live="polite"></div>
+    <form id="pwform" hidden autocomplete="off">
+      <input id="pdfpw" type="password" placeholder="PDF password" aria-label="PDF password" autocomplete="off">
+      <button class="btn primary" type="submit">Unlock</button>
+      <button class="btn" type="button" id="pwcancel">Cancel</button>
+    </form>
     <input id="pick" type="file" accept="application/pdf,.pdf" hidden>
   </div>
 
@@ -465,7 +524,7 @@ footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--border);font:
       <li class="item"><span class="art">⎙</span><div><div class="label">Scans and pictures of text</div>
         <div class="desc">No text to edit. Canva exports draw letters as shapes, same problem.</div></div></li>
       <li class="item"><span class="art">⚿</span><div><div class="label">Password-protected PDFs</div>
-        <div class="desc">Can't be opened. Remove the password first.</div></div></li>
+        <div class="desc">Open with the password you know. <strong>Remove password</strong> saves a copy without it; there's no way in without the password.</div></div></li>
       <li class="item"><span class="art">⊘</span><div><div class="label">Watermarks, stamps and legal notices</div>
         <div class="desc">Rotated, see-through or "all rights reserved" text is locked.</div></div></li>
       <li class="item"><span class="art">↧</span><div><div class="label">Text doesn't flow between blocks</div>
@@ -495,16 +554,29 @@ footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--border);font:
 <script>
 const drop = document.getElementById('drop'), msg = document.getElementById('msg'), pick = document.getElementById('pick');
 function say(text, err) { msg.textContent = text; msg.classList.toggle('err', !!err); }
-async function openPdf(file) {
+// a locked PDF: ask for its password, send it in a header (never in the URL), keep it nowhere
+const pwform = document.getElementById('pwform'), pdfpw = document.getElementById('pdfpw');
+let pending = null;
+async function openPdf(file, password) {
   if (!file) return;
   if (!/\.pdf$/i.test(file.name) && file.type !== 'application/pdf') return say(`${file.name} isn't a PDF.`, true);
-  say('Opening ' + file.name + '…');
+  say((password ? 'Unlocking ' : 'Opening ') + file.name + '…');
+  const headers = {'X-Filename': encodeURIComponent(file.name)};
+  if (password) headers['X-Pdf-Password'] = encodeURIComponent(password);
   try {
-    const r = await fetch('/open', {method: 'POST', headers: {'X-Filename': encodeURIComponent(file.name)}, body: file});
+    const r = await fetch('/open', {method: 'POST', headers, body: file});
     const j = await r.json();
-    if (j.id) location.href = '/d/' + j.id; else say(j.error, true);
+    if (j.id) { pdfpw.value = ''; location.href = '/d/' + j.id; return; }
+    if (j.needPassword) {
+      pending = file; pwform.hidden = false; pdfpw.value = ''; pdfpw.focus();
+      return say(j.wrong ? j.error : `${file.name} is locked. Enter its password to open it.`, j.wrong);
+    }
+    say(j.error, true);
   } catch (e) { say('Could not open the file: ' + e, true); }
 }
+pwform.onclick = e => e.stopPropagation();  // typing here shouldn't open the file picker
+pwform.onsubmit = e => { e.preventDefault(); if (pending && pdfpw.value) openPdf(pending, pdfpw.value); };
+document.getElementById('pwcancel').onclick = () => { pending = null; pdfpw.value = ''; pwform.hidden = true; say(''); };
 drop.onclick = () => pick.click();
 drop.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick.click(); } };
 pick.onchange = () => openPdf(pick.files[0]);
@@ -553,8 +625,9 @@ header{position:sticky;top:0;z-index:5;display:flex;gap:8px;align-items:center;p
 button{font-family:inherit;font-weight:500;font-size:14px;line-height:16px;border:0;border-radius:8px;padding:8px 12px;background:var(--btn);color:var(--fg);cursor:pointer;white-space:nowrap}
 button:hover{background:var(--btn-h)}
 button:disabled{opacity:.45;cursor:default}
-#keepwrap{display:flex;gap:6px;align-items:center;font-weight:500;color:var(--muted);white-space:nowrap;cursor:pointer;padding:0 4px}
-#keepwrap input{accent-color:var(--inverse);width:16px;height:16px;margin:0}
+#keepwrap,#unlockwrap{display:flex;gap:6px;align-items:center;font-weight:500;color:var(--muted);white-space:nowrap;cursor:pointer;padding:0 4px}
+#keepwrap input,#unlockwrap input{accent-color:var(--inverse);width:16px;height:16px;margin:0}
+#unlockwrap[hidden]{display:none}
 button[aria-pressed=true]{background:var(--inverse);color:var(--on-inverse)}
 button.primary{background:var(--inverse);color:var(--on-inverse)}
 #zoomv{min-width:4.5ch;text-align:center;color:var(--muted);font-variant-numeric:tabular-nums}
@@ -607,6 +680,7 @@ main{display:flex;flex-direction:column;align-items:center;gap:20px;padding:24px
     <button id="addtext" aria-pressed="false" title="Add a text box: click here, then click on the page (Esc cancels)">+ Text</button>
     <button id="discard" disabled title="Throw away all edits in this PDF">Discard</button>
     <button id="revert" hidden title="Throw away the edits saved in this file and show the original">Revert to original</button>
+    <label id="unlockwrap" hidden title="Save a copy that opens without a password. Untick to keep the same password on the saved copy."><input type="checkbox" id="unlock" checked> Remove password</label>
     <label id="keepwrap" title="Put the original PDF inside the saved file so Linotype can reopen your edits or revert them. Anyone with the file can extract the original: turn this off before sharing a file you edited to hide something."><input type="checkbox" id="keep" checked> Keep original</label>
     <button id="save" class="primary" title="Save an edited copy (⌘S)">Save PDF</button>
   </div>
@@ -665,7 +739,7 @@ function ask(text, yes) {
 
 // ---- pages ----
 // ---- a file Linotype saved with "Keep original": restore its edits as live boxes ----
-let restore = [], restored = {}, restoring = {};
+let restore = [], restored = {}, restoring = {}, locked = false;
 function restorePage(i) {
   const items = (restore.find(p => p.page === i) || {}).items;
   if (!items || !items.length || restored[i]) return;
@@ -693,6 +767,9 @@ fetch(`/d/${id}/info`).then(r => r.ok ? r.json() : Promise.reject()).then(info =
   $('name').textContent = info.name; $('name').title = info.name; document.title = info.name + ' · Linotype';
   restore = info.restore || [];
   $('revert').hidden = !info.hasOriginal;
+  locked = !!info.locked;
+  $('unlockwrap').hidden = !locked;
+  if (locked) $('count').textContent = 'Locked PDF · Save PDF gives a copy without the password';
   info.pages.forEach(([w, h], i) => {
     const box = document.createElement('div'); box.className = 'pg';
     const f = document.createElement('iframe');
@@ -748,7 +825,8 @@ addEventListener('message', e => {
   const n = counts.reduce((a, b) => a + b, 0);
   if (n && !dirty && !e.data.restored) markDirty(true);
   $('count').textContent = n ? `${n} block${n > 1 ? 's' : ''} edited${dirty ? '' : ' · saved'}`
-                              : dirty ? 'Reverted to original · not saved' : 'Click any text to edit';
+                              : dirty ? 'Reverted to original · not saved'
+                              : locked ? 'Locked PDF · Save PDF gives a copy without the password' : 'Click any text to edit';
   $('count').classList.toggle('dirty', n > 0 && dirty);
   $('discard').disabled = n === 0;
 });
@@ -891,11 +969,13 @@ async function save() {
       const items = w.collectState(); if (items.length) state.push({page, items});
     }
   });
-  if (!edits.length) return toast('Nothing edited yet. Click any text on the page to change it.');
+  const unlockOnly = locked && $('unlock').checked;  // a locked PDF can be saved just to drop its password
+  if (!edits.length && !unlockOnly) return toast('Nothing edited yet. Click any text on the page to change it.');
   const btn = $('save'); btn.disabled = true; btn.textContent = 'Saving…';
   try {
     const keep = $('keep').checked;
-    const r = await fetch(`/d/${id}/save`, {method: 'POST', body: JSON.stringify({edits, state, keep})});
+    const unlock = !locked || $('unlock').checked;
+    const r = await fetch(`/d/${id}/save`, {method: 'POST', body: JSON.stringify({edits, state, keep, unlock})});
     if ((r.headers.get('Content-Type') || '').startsWith('application/pdf')) {
       // server mode: the saved PDF comes back as a download
       const name = decodeURIComponent(r.headers.get('X-Linotype-Name') || 'edited.pdf');
@@ -904,7 +984,8 @@ async function save() {
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(a.href), 60000);
       markDirty(false); $('count').classList.remove('dirty');
-      toast('Downloaded ' + name + (r.headers.get('X-Linotype-Kept') === '1' ? ' · original kept inside' : ''), null, 8000);
+      toast('Downloaded ' + name + (r.headers.get('X-Linotype-Unlocked') === '1' ? ' · password removed' : '') +
+            (r.headers.get('X-Linotype-Kept') === '1' ? ' · original kept inside' : ''), null, 8000);
       btn.disabled = false; btn.textContent = 'Save PDF';
       return;
     }
@@ -912,7 +993,7 @@ async function save() {
     if (j.path) {
       markDirty(false); $('count').classList.remove('dirty');
       $('count').textContent = $('count').textContent.replace(/ · saved$/, '') + ' · saved';
-      toast('Saved ' + j.name + (j.kept ? ' · original kept inside' : ''),
+      toast('Saved ' + j.name + (j.unlocked ? ' · password removed' : '') + (j.kept ? ' · original kept inside' : ''),
             {label: 'Show in Finder', run: () => fetch(`/d/${id}/reveal`, {method: 'POST'})}, 8000);
     } else toast(j.error, null, 8000);
   } catch (e) { toast('Save failed: ' + e); }

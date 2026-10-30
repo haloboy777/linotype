@@ -114,7 +114,8 @@ Output lands in `engine/out/`, which is git-ignored because it holds renders of 
 
 ## Known gaps
 
-- Canva exports draw every letter as a shape; there is no text to edit without OCR.
+- Scanned pages are pictures of text, and Canva exports draw every letter as a shape: there is no text to edit without OCR.
+- Password-protected PDFs open only with their password. **Remove password** (on by default for those files) saves a copy without it; untick it to keep the same password. There is no way in without the password.
 - CID-keyed CFF fonts fall back to system fonts.
 - Glyphs with no Unicode mapping (some chart symbols) draw nothing.
 - Text painted underneath an image ends up on top of it.

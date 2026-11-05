@@ -302,7 +302,7 @@ class Handler(BaseHTTPRequestHandler):
         if m.group(2) == "/info":
             return self.json({"name": s.name, "pages": [[p.rect.width, p.rect.height] for p in s.doc],
                               "restore": s.restore, "hasOriginal": s.has_original,
-                              "locked": s.password is not None})
+                              "locked": s.password is not None, "sign": SERVER})
         n = int(m.group(3))
         if not 0 <= n < len(s.doc):
             return self.send("No such page", "text/plain", 404)
@@ -337,7 +337,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json({"error": str(e), "needPassword": True, "wrong": e.wrong}, 422)
                 except ValueError as e:
                     return self.json({"error": str(e)}, 400)
-            m = re.fullmatch(r"/d/([\w-]+)/(save|close|reveal|font|font-remove)", path)
+            m = re.fullmatch(r"/d/([\w-]+)/(save|close|reveal|font|font-remove|signing-copy)", path)
             s = sessions.get(m.group(1)) if m else None
             if not s:
                 return self.json({"error": "This document was closed after being idle. Open the file again."}, 404)
@@ -372,6 +372,13 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(body, list):  # older pages sent just the edit list
                 body = {"edits": body, "state": [], "keep": False}
             edits = body["edits"]
+            if action == "signing-copy":  # the bytes the signer on the visitor's computer will sign
+                with s.lock:
+                    if not edits:  # unedited: the file exactly as opened, so earlier signatures stay valid
+                        return self.send(s.data, "application/pdf")
+                    if s.doc.get_sigflags() > 0:
+                        return self.json({"error": "This PDF is already signed, and saving edits would break those signatures. Discard your edits, then sign."}, 409)
+                    return self.send(writeback.apply(s.data, edits, s.fonts), "application/pdf")
             remove_pw = s.password is not None and body.get("unlock", True)
             with s.lock:
                 out = writeback.apply(s.data, edits, s.fonts)
@@ -634,6 +641,20 @@ button.primary{background:var(--inverse);color:var(--on-inverse)}
 main{display:flex;flex-direction:column;align-items:center;gap:20px;padding:24px 16px 80px}
 .pg{background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.15),0 8px 24px rgba(0,0,0,.08);overflow:hidden;flex:none}
 .pg iframe{border:0;display:block;transform-origin:0 0}
+.pg{position:relative}
+body.signing{user-select:none;-webkit-user-select:none}
+.sigcover{position:absolute;inset:0;cursor:crosshair;z-index:5;user-select:none;-webkit-user-select:none}
+.sigcover.busy{cursor:progress}
+.sigstamp{position:absolute;container-type:size;outline:1px dashed #276EF1;visibility:hidden;pointer-events:none}
+.sigstamp.placed{outline-style:solid;outline-width:2px;pointer-events:auto;cursor:move;touch-action:none}
+.sigstamp.locked{pointer-events:none;outline-width:1px}
+.sighandle{position:absolute;right:-7px;bottom:-7px;width:14px;height:14px;background:#276EF1;border:2px solid #fff;border-radius:50%;cursor:nwse-resize;touch-action:none;display:none}
+.sigstamp.placed .sighandle{display:block}
+.sigstamp.locked .sighandle{display:none}
+#signbar{position:fixed;left:50%;bottom:64px;transform:translateX(-50%);display:flex;gap:10px;align-items:center;background:var(--bar);border:1px solid var(--line);border-radius:10px;padding:8px 8px 8px 14px;box-shadow:0 4px 16px rgba(0,0,0,.2);z-index:20;white-space:nowrap}
+#signbar[hidden]{display:none}
+.sigstamp img{position:absolute;left:.9%;top:3%;width:54%;height:94%;object-fit:contain;object-position:left center}
+.sigstamp div{position:absolute;white-space:nowrap;color:#000;font:calc(6 / 65 * 100cqh)/1 Courier,monospace}
 #pageno{position:fixed;right:16px;bottom:16px;background:var(--bar);border:1px solid var(--line);border-radius:8px;padding:4px 10px;color:var(--muted);font-variant-numeric:tabular-nums}
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);display:flex;gap:10px;align-items:center;background:#111;color:#fff;padding:10px 12px 10px 16px;border-radius:10px;opacity:0;pointer-events:none;transition:.2s;max-width:calc(100% - 32px)}
 #toast.on{opacity:1;pointer-events:auto}
@@ -682,10 +703,12 @@ main{display:flex;flex-direction:column;align-items:center;gap:20px;padding:24px
     <button id="revert" hidden title="Throw away the edits saved in this file and show the original">Revert to original</button>
     <label id="unlockwrap" hidden title="Save a copy that opens without a password. Untick to keep the same password on the saved copy."><input type="checkbox" id="unlock" checked> Remove password</label>
     <label id="keepwrap" title="Put the original PDF inside the saved file so Linotype can reopen your edits or revert them. Anyone with the file can extract the original: turn this off before sharing a file you edited to hide something."><input type="checkbox" id="keep" checked> Keep original</label>
+    <button id="signbtn" hidden title="Sign with your USB token. Needs the Linotype signer running on this computer. Click here, then click on the page (Esc cancels)">✍ Sign</button>
     <button id="save" class="primary" title="Save an edited copy (⌘S)">Save PDF</button>
   </div>
 </header>
 <main id="pages"></main>
+<div id="signbar" hidden><span>Drag to move · drag the corner to resize</span><button id="signcancel">Cancel</button><button id="signgo" class="primary">Sign here</button></div>
 <div id="pageno"></div>
 <div id="toast"><span id="toastmsg"></span><button id="toastbtn" hidden></button></div>
 <div id="fonts" role="dialog" aria-modal="true" aria-labelledby="fontstitle"><div class="card">
@@ -768,6 +791,8 @@ fetch(`/d/${id}/info`).then(r => r.ok ? r.json() : Promise.reject()).then(info =
   restore = info.restore || [];
   $('revert').hidden = !info.hasOriginal;
   locked = !!info.locked;
+  ptSizes = info.pages;
+  $('signbtn').hidden = !info.sign;
   $('unlockwrap').hidden = !locked;
   if (locked) $('count').textContent = 'Locked PDF · Save PDF gives a copy without the password';
   info.pages.forEach(([w, h], i) => {
@@ -958,8 +983,175 @@ async function closeDoc() {
 $('back').onclick = closeDoc;
 addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
 
+// ---- sign: the signer on this computer talks to the USB token; this server never sees the PIN ----
+const SIGNER = 'http://127.0.0.1:47823', SIG_W = 220, SIG_H = 65;
+let ptSizes = [], signMode = false, covers = [], stamp = null, stampUrl = null;
+async function signerCall(path, opts) {
+  let r;
+  try { r = await fetch(SIGNER + path, opts); }
+  catch (e) { throw new Error('The Linotype signer isn\'t running on this computer. Start linotype-signer, allow Chrome to reach it if asked, then try again.'); }
+  if (r.ok) return r;
+  const j = await r.json().catch(() => ({}));
+  const err = new Error(j.error || `The signer answered ${r.status}.`);
+  err.code = j.code;
+  throw err;
+}
+// While signing, the page can't be edited, selected or copied: what's on screen is what gets signed.
+function lockForSigning(on) {
+  signMode = on;
+  document.body.classList.toggle('signing', on);
+  if (on) { setAdding(false); document.activeElement && document.activeElement.blur(); getSelection().removeAllRanges(); }
+  frames.forEach(f => {
+    try {
+      if (on) { f.contentDocument.activeElement && f.contentDocument.activeElement.blur(); f.contentWindow.getSelection().removeAllRanges(); }
+    } catch (e) {}
+    f.inert = on;
+  });
+  document.querySelectorAll('header button, header label').forEach(el => {
+    if (!['signbtn', 'zin', 'zout', 'zfit'].includes(el.id)) el.inert = on;
+  });
+  $('signbtn').setAttribute('aria-pressed', on);
+}
+// The same layout the signer draws into the PDF, in percent so it follows the zoom.
+function buildStamp(signer) {
+  const el = document.createElement('div'); el.className = 'sigstamp';
+  const textX = stampUrl ? 124.8 : 4;
+  if (stampUrl) { const img = document.createElement('img'); img.src = stampUrl; img.alt = ''; el.appendChild(img); }
+  const now = new Date(), two = n => String(n).padStart(2, '0');
+  const date = `${two(now.getDate())} ${now.toLocaleString('en', {month: 'short'})} ${now.getFullYear()} ${two(now.getHours())}:${two(now.getMinutes())}`;
+  ['Digitally signed by', signer, 'Date: ' + date].forEach((text, i) => {
+    const line = document.createElement('div'); line.textContent = text;
+    line.style.left = textX / SIG_W * 100 + '%';
+    line.style.bottom = (SIG_H / 2 + 8 - i * 8) / SIG_H * 100 + '%';
+    el.appendChild(line);
+  });
+  return el;
+}
+function endSigning() {
+  covers.forEach(c => c.remove()); covers = []; stamp = null; sig = null;
+  if (stampUrl) { URL.revokeObjectURL(stampUrl); stampUrl = null; }
+  lockForSigning(false);
+  $('signbar').hidden = true;
+  const btn = $('signbtn'); btn.disabled = false; btn.textContent = '✍ Sign';
+}
+// sig: where the stamp is, in PDF points from the page's top-left. Its shape stays fixed, so the text keeps its proportions.
+let sig = null;
+const SIG_MIN = 110;
+function savedWidth() { try { return +localStorage.getItem('linotype.sigWidth') || SIG_W; } catch (e) { return SIG_W; } }
+function drawStamp() {
+  const [w, h] = ptSizes[sig.page];
+  if (stamp.parentNode !== covers[sig.page]) covers[sig.page].appendChild(stamp);
+  stamp.style.visibility = 'visible';
+  stamp.style.left = sig.x / w * 100 + '%'; stamp.style.top = sig.top / h * 100 + '%';
+  stamp.style.width = sig.w / w * 100 + '%'; stamp.style.height = sig.w * SIG_H / SIG_W / h * 100 + '%';
+}
+// keep the whole stamp on its page: shrink it if needed, then nudge it inside
+function fitStamp() {
+  const [w, h] = ptSizes[sig.page];
+  sig.w = Math.max(Math.min(sig.w, w, h * SIG_W / SIG_H), Math.min(SIG_MIN, w));
+  sig.x = Math.min(Math.max(sig.x, 0), w - sig.w);
+  sig.top = Math.min(Math.max(sig.top, 0), h - sig.w * SIG_H / SIG_W);
+}
+function pagePoint(e, page) {
+  const r = boxes[page].getBoundingClientRect(), k = r.width / ptSizes[page][0];
+  return {x: (e.clientX - r.left) / k, y: (e.clientY - r.top) / k};
+}
+function centreStamp(e, page) {
+  const p = pagePoint(e, page);
+  sig.page = page; sig.x = p.x - sig.w / 2; sig.top = p.y - sig.w * SIG_H / SIG_W / 2;
+  fitStamp(); drawStamp();
+}
+function startPlacing(signer) {
+  lockForSigning(true);
+  stamp = buildStamp(signer);
+  const handle = document.createElement('div'); handle.className = 'sighandle'; stamp.appendChild(handle);
+  sig = {page: 0, x: 0, top: 0, w: savedWidth()};
+  covers = boxes.map((box, page) => {
+    const cover = document.createElement('div'); cover.className = 'sigcover';
+    box.appendChild(cover);
+    cover.onmousemove = e => { if (!stamp.classList.contains('placed')) centreStamp(e, page); };
+    cover.onmouseleave = () => { if (!stamp.classList.contains('placed')) stamp.style.visibility = 'hidden'; };
+    cover.onclick = e => {  // first click puts it down; later clicks move it there
+      if (e.target !== cover) return;
+      centreStamp(e, page);
+      if (!stamp.classList.contains('placed')) { stamp.classList.add('placed'); $('signbar').hidden = false; $('toast').classList.remove('on'); }
+    };
+    return cover;
+  });
+  stamp.onpointerdown = e => {
+    e.preventDefault(); e.stopPropagation();
+    const resizing = e.target === handle, start = pagePoint(e, sig.page), from = {...sig};
+    stamp.setPointerCapture(e.pointerId);
+    stamp.onpointermove = m => {
+      const p = pagePoint(m, sig.page);
+      if (resizing) sig.w = from.w + p.x - start.x;
+      else { sig.x = from.x + p.x - start.x; sig.top = from.top + p.y - start.y; }
+      fitStamp(); drawStamp();
+    };
+    stamp.onpointerup = () => { stamp.onpointermove = stamp.onpointerup = null; };
+  };
+  stamp.onclick = e => e.stopPropagation();
+  toast('Click where your signature should go · Esc cancels', null, 15000);
+}
+function signHere() {
+  if (!sig || !stamp.classList.contains('placed')) return;
+  try { localStorage.setItem('linotype.sigWidth', sig.w); } catch (e) {}
+  stamp.classList.add('locked');
+  covers.forEach(c => { c.onmousemove = c.onmouseleave = c.onclick = null; c.classList.add('busy'); });
+  $('signbar').hidden = true;
+  const h = sig.w * SIG_H / SIG_W;
+  signAt(sig.page, sig.x, ptSizes[sig.page][1] - sig.top - h, sig.w, h);
+}
+$('signgo').onclick = signHere;
+$('signcancel').onclick = () => { toast('Signing cancelled.'); endSigning(); };
+async function signAt(page, x, y, w, h) {
+  const btn = $('signbtn'); btn.disabled = true; btn.textContent = 'Waiting for you…';
+  try {
+    await loadRestoredPages();
+    const edits = [];
+    frames.forEach((f, p) => {
+      const cw = f.contentWindow;
+      if (cw && cw.collectEdits) { const blocks = cw.collectEdits(); if (blocks.length) edits.push({page: p, blocks}); }
+    });
+    const copy = await fetch(`/d/${id}/signing-copy`, {method: 'POST', body: JSON.stringify({edits})});
+    if (!(copy.headers.get('Content-Type') || '').startsWith('application/pdf')) {
+      const j = await copy.json().catch(() => ({}));
+      throw new Error(j.error || 'Could not prepare the PDF.');
+    }
+    toast('Check the window from the Linotype signer: approve there and enter your PIN. Refreshing this page cancels.', null, 120000);
+    const q = new URLSearchParams({page: page + 1, x: x.toFixed(1), y: y.toFixed(1), w: w.toFixed(1), h: h.toFixed(1), name: $('name').textContent});
+    const r = await signerCall(`/sign?${q}`, {method: 'POST', headers: {'Content-Type': 'application/pdf'}, body: await copy.blob()});
+    const name = decodeURIComponent(r.headers.get('X-Signed-Name') || 'signed.pdf');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(await r.blob()); a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    toast('Signed and downloaded ' + name, null, 8000);
+  } catch (e) {
+    toast(e.code === 'cancelled' ? 'Signing cancelled.' : e.message, null, e.code === 'wrong_pin' ? 15000 : 10000);
+  }
+  endSigning();
+}
+$('signbtn').onclick = async () => {
+  if (signMode) { toast('Signing cancelled.'); return endSigning(); }
+  try {
+    const st = await (await signerCall('/status')).json();
+    if (st.pinLocked) return toast('Your token\'s PIN is locked. Your certifying authority has to unblock it.', null, 10000);
+    if (st.pinFinalTry && !await ask('One PIN attempt is left on this token. A wrong PIN will lock it. Continue?', 'Continue')) return;
+    if (st.hasImage) stampUrl = URL.createObjectURL(await (await signerCall('/signature')).blob());
+    startPlacing(st.signer);
+  } catch (e) { toast(e.message, null, 10000); }
+};
+addEventListener('keydown', e => {
+  if (e.key === 'Escape' && signMode && !$('signbtn').disabled) { toast('Signing cancelled.'); endSigning(); }
+  if (e.key === 'Enter' && signMode && !$('signbtn').disabled && !$('signbar').hidden) { e.preventDefault(); signHere(); }
+  if (signMode && (e.metaKey || e.ctrlKey) && ['a', 'c', 'x', 's', 'p'].includes(e.key.toLowerCase())) { e.preventDefault(); e.stopPropagation(); }
+}, true);
+['copy', 'cut', 'selectstart', 'dragstart'].forEach(t => addEventListener(t, e => { if (signMode) e.preventDefault(); }, true));
+
 // ---- save ----
 async function save() {
+  if (signMode) return;
   await loadRestoredPages();
   const edits = [], state = [];
   frames.forEach((f, page) => {

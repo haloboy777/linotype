@@ -1,0 +1,28 @@
+name: signer
+on:
+  push:
+    paths: ["signer/**", ".github/workflows/signer.yml"]
+  workflow_dispatch:
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-latest, name: linotype-signer-macos-arm64}
+          - {os: ubuntu-latest, name: linotype-signer-linux-x86_64}
+          - {os: windows-latest, name: linotype-signer-windows-x86_64.exe}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: signer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: {go-version-file: signer/go.mod, cache-dependency-path: signer/go.sum}
+      - run: go vet .
+      - run: go test -short .
+      - run: go build -trimpath -ldflags="-s -w" -o ${{ matrix.name }} .
+        env: {CGO_ENABLED: "1"}
+      - uses: actions/upload-artifact@v4
+        with: {name: "${{ matrix.name }}", path: "signer/${{ matrix.name }}"}

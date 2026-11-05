@@ -1134,13 +1134,15 @@ async function signAt(page, x, y, w, h) {
 }
 $('signbtn').onclick = async () => {
   if (signMode) { toast('Signing cancelled.'); return endSigning(); }
+  const btn = $('signbtn'); btn.disabled = true; btn.textContent = 'Checking token…';  // loading the token driver takes seconds
   try {
     const st = await (await signerCall('/status')).json();
-    if (st.pinLocked) return toast('Your token\'s PIN is locked. Your certifying authority has to unblock it.', null, 10000);
+    if (st.pinLocked) throw new Error('Your token\'s PIN is locked. Your certifying authority has to unblock it.');
     if (st.pinFinalTry && !await ask('One PIN attempt is left on this token. A wrong PIN will lock it. Continue?', 'Continue')) return;
     if (st.hasImage) stampUrl = URL.createObjectURL(await (await signerCall('/signature')).blob());
     startPlacing(st.signer);
   } catch (e) { toast(e.message, null, 10000); }
+  btn.disabled = false; btn.textContent = '✍ Sign';
 };
 addEventListener('keydown', e => {
   if (e.key === 'Escape' && signMode && !$('signbtn').disabled) { toast('Signing cancelled.'); endSigning(); }
